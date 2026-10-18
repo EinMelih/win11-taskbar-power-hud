@@ -1,4 +1,4 @@
-﻿// ==WindhawkMod==
+// ==WindhawkMod==
 // @id              main-pc-live-telemetry
 // @name            Main PC Live Power, Cost Analytics & Hardware HUD (Claude v3.0 Edition)
 // @description     Echtes Claude-Design Taskleisten-HUD mit Task-Manager-GHz, Drossel-Erkennung, Top-3 App-Icons in der RAM-Pille, 60-FPS Hover-Popouts (CPU/GPU/RAM Top-3 Programme) & Z:-Langzeit-Logging.
@@ -6,25 +6,25 @@
 // @author          EinMelih & Antigravity
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lgdi32 -luser32 -lshell32 -lgdiplus -lole32 -lcomdlg32 -lpdh -lpsapi
+// @compilerOptions -lgdi32 -luser32 -lshell32 -lgdiplus -lole32 -lcomdlg32 -lpdh -lpsapi -liphlpapi
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
-# Main PC Live Power, Cost Analytics & Hardware HUD (v3.0 – Claude Design Edition)
+# Main PC Live Power, Cost Analytics & Hardware HUD (v3.1 – Claude Design Edition)
 
 Maßgeschneiderte Taskleisten-Mod & Energie-Analyse-Suite für **EinMelihs Main PC**:
 - **Echtes Claude-Design (Anthropic Warm Dark Palette):** Edles Warm-Obsidian (`#191918` / `#242321`), Pergament-Typografie (`#F5F4EF`) und Claude-Terracotta (`#D97757`) Akzente.
 - **Exakter Task-Manager GHz-Takt:** Liest über die Windows PDH-Engine (`% Processor Performance`) den identischen aktiven Boost-Takt wie der Windows Task-Manager (`z.B. 4.58 GHz`) plus den SMU Peak-Takt.
+- **Live WiFi / Netzwerk-Speed (`MB/s`, `Mbit/s`, `GB/s`):** Zeigt den aktuellen Netzwerk-Durchsatz in Echtzeit; per Hover oder Klick jederzeit frei umschaltbar zwischen `MB/s`, `Mbit/s` und `GB/s`.
 - **Hardware-kalibrierte Temperatur-Farben & Live Drossel-Anzeige (Throttling):**
   - `<= 66 °C`: Smaragdgrün (Kühl / Optimal für Ryzen 7 5800X & RX 9070 XT)
   - `67–77 °C`: Warm-Gold (Normaler Gaming-Betrieb)
   - `78–86 °C`: Vivid Orange (Hohe Volllast)
   - `>= 87 °C`: Rubinrot (Nahe am `90 °C` TjMax-Drossellimit)
   - Zeigt live an, ob gedrosselt wird (`✓ Keine Drosselung` vs. `⚡ PBO-Limit` vs. `⚠️ Thermal Throttle`).
-- **Top-3 RAM App-Icons direkt in der Taskleiste + 60-FPS Hover-Animation:**
-  - Direkt in der RAM-Karte auf der Taskleiste erscheinen die **echten Programm-Icons der Top-3 RAM-Apps**.
-  - Beim Drüberfahren mit der Maus (`Hover`) gleitet mit einer **60-FPS Animation** eine Claude-Hover-Card über `CPU`, `GPU` oder `RAM` auf und zeigt die **Top-3 Programme mit echten Icons, Verbrauch und allen Temperaturen/Limits**.
+- **60-FPS Hover-Animation (`CPU`, `GPU`, `RAM`, `WIFI`):**
+  - Beim Drüberfahren mit der Maus (`Hover`) gleitet mit einer **60-FPS Animation** eine Claude-Hover-Card über `CPU`, `GPU`, `RAM` (Top-3 Programme mit echten Icons) oder `WIFI` (Download/Upload + Einheiten-Umschalter `MB/s` / `Mbit/s` / `GB/s`) auf.
 - **1-Klick Analyse-Flyout & `Z:\`-Langzeit-Logger:** Linksklick öffnet das große Diagramm-Dashboard (Tages- & Monatsverlauf in `€` und `Wh` aus `Z:\_inbox\PC_Stromverbrauch\power_log.json`).
 */
 // ==/WindhawkModReadme==
@@ -46,7 +46,11 @@ Maßgeschneiderte Taskleisten-Mod & Energie-Analyse-Suite für **EinMelihs Main 
 */
 // ==/WindhawkModSettings==
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
 #include <shellapi.h>
 #include <commdlg.h>
 #include <tlhelp32.h>
@@ -71,6 +75,12 @@ Maßgeschneiderte Taskleisten-Mod & Energie-Analyse-Suite für **EinMelihs Main 
 #include <cstdio>
 
 using namespace Gdiplus;
+
+enum NetUnitMode {
+    NET_UNIT_MB   = 0, // MB/s (Default)
+    NET_UNIT_MBIT = 1, // Mbit/s
+    NET_UNIT_GB   = 2  // GB/s
+};
 
 struct Settings {
     int updateIntervalMs = 1000;
@@ -116,6 +126,12 @@ struct TelemetryData {
     double ramTotalGb = 32.0;
     int ramUsedPct = 0;
 
+    double netDownBps = 0.0;
+    double netUpBps = 0.0;
+    double netTotalBps = 0.0;
+    double netLinkSpeedBps = 1000000000.0;
+    bool netIsWifi = false;
+
     std::vector<TopAppEntry> topRamApps; // Top 3 by RAM MB
     std::vector<TopAppEntry> topCpuApps; // Top 3 by CPU %
     std::vector<TopAppEntry> topGpuApps; // Top 3 by GPU % / VRAM MB
@@ -142,6 +158,7 @@ struct PowerLogState {
     std::wstring csvFilePath    = L"Z:\\_inbox\\PC_Stromverbrauch\\power_daily.csv";
     std::wstring backupFilePath = L".\\power_log_backup.json";
     double eurPerKwh = 0.32;
+    int netUnitMode = NET_UNIT_MB; // 0 = MB/s, 1 = Mbit/s, 2 = GB/s
 
     std::string currentDate;  // YYYY-MM-DD
     std::string currentMonth; // YYYY-MM
@@ -165,13 +182,15 @@ static std::deque<float> g_wattHistory; // last 60 seconds
 static PowerLogState g_log;
 
 // Hover state & 60-FPS animation state
-// Sections: -1 = None, 0 = Strom, 1 = CPU, 2 = GPU, 3 = RAM, 4 = Euro
+// Sections: -1 = None, 0 = Strom, 1 = CPU, 2 = GPU, 3 = RAM, 4 = WiFi/Net, 5 = Euro
 static int   g_hoveredCardIdx   = -1;
 static int   g_activeHoverIdx   = 1;
 static float g_hoverAnimProgress = 0.0f; // 0.0 (hidden) .. 1.0 (fully shown)
 static float g_hoverAnimCenterX  = 0.0f; // smoothly interpolated screen X
-static RECT  g_cardRectsLocal[5] = {};   // local X ranges of the 5 micro-cards inside HUD
-static RECT  g_lastPillScreenRect = {3000, 2088, 3470, 2144};
+static RECT  g_cardRectsLocal[6] = {};   // local X ranges of the 6 micro-cards inside HUD
+static RECT  g_lastPillScreenRect = {2900, 2088, 3470, 2144};
+static RECT  g_lastHoverScreenRect = {};
+static RECT  g_rcHoverUnitBtns[3] = {};  // [0]=MB/s, [1]=Mbit/s, [2]=GB/s inside Hover window
 static bool  g_mouseTracking = false;
 
 // Interactive hitboxes inside the Flyout window
@@ -339,20 +358,26 @@ static void LoadPowerConfig() {
     std::string content = ss.str();
     std::string logP = ExtractJsonString(content, "logFilePath", "");
     std::string csvP = ExtractJsonString(content, "csvFilePath", "");
+    std::string netU = ExtractJsonString(content, "netUnit", "MB");
     double tariff = ExtractJsonNumber(content, "eurPerKwh", g_log.eurPerKwh);
     if (!logP.empty()) g_log.logFilePath = Utf8ToWide(logP);
     if (!csvP.empty()) g_log.csvFilePath = Utf8ToWide(csvP);
     if (tariff > 0.05 && tariff < 2.0) g_log.eurPerKwh = tariff;
+    if (netU == "Mbit" || netU == "mbit") g_log.netUnitMode = NET_UNIT_MBIT;
+    else if (netU == "GB" || netU == "gb") g_log.netUnitMode = NET_UNIT_GB;
+    else g_log.netUnitMode = NET_UNIT_MB;
 }
 
 static void SavePowerConfig() {
     EnsureParentDirectory(g_log.configFilePath);
     std::ofstream f(g_log.configFilePath.c_str(), std::ios::trunc);
     if (!f.is_open()) return;
+    const char* unitStr = (g_log.netUnitMode == NET_UNIT_MBIT) ? "Mbit" : ((g_log.netUnitMode == NET_UNIT_GB) ? "GB" : "MB");
     f << "{\n"
       << "  \"logFilePath\": \"" << EscapeJsonString(WideToUtf8(g_log.logFilePath)) << "\",\n"
       << "  \"csvFilePath\": \"" << EscapeJsonString(WideToUtf8(g_log.csvFilePath)) << "\",\n"
-      << "  \"eurPerKwh\": " << std::fixed << std::setprecision(4) << g_log.eurPerKwh << "\n"
+      << "  \"eurPerKwh\": " << std::fixed << std::setprecision(4) << g_log.eurPerKwh << ",\n"
+      << "  \"netUnit\": \"" << unitStr << "\"\n"
       << "}\n";
 }
 
@@ -984,6 +1009,72 @@ static void ReadAllSensors(TelemetryData& out, bool updateProcesses) {
         out.ramUsedPct = (int)memInfo.dwMemoryLoad;
     }
 
+    // 3b. Network / WiFi Speed via GetIfTable2 (iphlpapi)
+    {
+        static ULONGLONG s_prevNetInBytes  = 0;
+        static ULONGLONG s_prevNetOutBytes = 0;
+        static ULONGLONG s_prevNetTickMs   = 0;
+        static double    s_lastNetDownBps  = 0.0;
+        static double    s_lastNetUpBps    = 0.0;
+
+        PMIB_IF_TABLE2 pIfTable = nullptr;
+        if (GetIfTable2(&pIfTable) == NO_ERROR && pIfTable) {
+            ULONGLONG totalIn = 0;
+            ULONGLONG totalOut = 0;
+            ULONGLONG bestLinkBps = 100000000ULL;
+            bool isWifiActive = false;
+
+            for (ULONG i = 0; i < pIfTable->NumEntries; i++) {
+                const MIB_IF_ROW2& row = pIfTable->Table[i];
+                if (row.OperStatus != IfOperStatusUp) continue;
+                if (row.InterfaceAndOperStatusFlags.FilterInterface) continue;
+                if (row.Type != IF_TYPE_ETHERNET_CSMACD && row.Type != IF_TYPE_IEEE80211) continue;
+
+                // Exclude virtual/WSL/Hyper-V/VPN/Loopback/Bluetooth interfaces
+                if (wcsstr(row.Description, L"Hyper-V") ||
+                    wcsstr(row.Description, L"Virtual") ||
+                    wcsstr(row.Description, L"vEthernet") ||
+                    wcsstr(row.Description, L"TAP-") ||
+                    wcsstr(row.Description, L"OpenVPN") ||
+                    wcsstr(row.Description, L"Loopback") ||
+                    wcsstr(row.Description, L"Bluetooth") ||
+                    wcsstr(row.Description, L"VMware") ||
+                    wcsstr(row.Description, L"VirtualBox")) {
+                    continue;
+                }
+
+                totalIn  += row.InOctets;
+                totalOut += row.OutOctets;
+                if (row.ReceiveLinkSpeed > bestLinkBps && row.ReceiveLinkSpeed <= 100000000000ULL) {
+                    bestLinkBps = row.ReceiveLinkSpeed;
+                }
+                if (row.Type == IF_TYPE_IEEE80211) {
+                    isWifiActive = true;
+                }
+            }
+            FreeMibTable(pIfTable);
+
+            ULONGLONG nowNetTick = GetTickCount64();
+            if (s_prevNetTickMs > 0 && nowNetTick > s_prevNetTickMs &&
+                totalIn >= s_prevNetInBytes && totalOut >= s_prevNetOutBytes) {
+                double dtNet = (double)(nowNetTick - s_prevNetTickMs) / 1000.0;
+                if (dtNet >= 0.1) {
+                    s_lastNetDownBps = (double)(totalIn - s_prevNetInBytes) / dtNet;
+                    s_lastNetUpBps   = (double)(totalOut - s_prevNetOutBytes) / dtNet;
+                }
+            }
+            s_prevNetInBytes  = totalIn;
+            s_prevNetOutBytes = totalOut;
+            s_prevNetTickMs   = nowNetTick;
+
+            out.netDownBps      = s_lastNetDownBps;
+            out.netUpBps        = s_lastNetUpBps;
+            out.netTotalBps     = s_lastNetDownBps + s_lastNetUpBps;
+            out.netLinkSpeedBps = (double)bestLinkBps;
+            out.netIsWifi       = isWifiActive;
+        }
+    }
+
     // 4. Restsystem (MSI B550 + 4x RAM + ROG Ryujin AIO + 5 Luefter + 2x SSD: 36-45 W) & EVGA 650 G2 Efficiency
     double loadFactor = ((out.cpuPptW - 35.0) / 100.0) * 0.5 + ((double)out.gpuLoadPct / 100.0) * 0.5;
     if (loadFactor < 0.0) loadFactor = 0.0;
@@ -999,6 +1090,36 @@ static void ReadAllSensors(TelemetryData& out, bool updateProcesses) {
     }
 
     out.valid = true;
+}
+
+static void FormatNetSpeed(double bytesPerSec, int unitMode, wchar_t* outBuf, size_t bufLen) {
+    if (bytesPerSec < 0.0) bytesPerSec = 0.0;
+    if (unitMode == NET_UNIT_MBIT) {
+        double mbit = (bytesPerSec * 8.0) / 1000000.0;
+        if (mbit >= 100.0) {
+            swprintf(outBuf, bufLen, L"%.0f Mbit/s", mbit);
+        } else if (mbit >= 10.0) {
+            swprintf(outBuf, bufLen, L"%.1f Mbit/s", mbit);
+        } else {
+            swprintf(outBuf, bufLen, L"%.2f Mbit/s", mbit);
+        }
+    } else if (unitMode == NET_UNIT_GB) {
+        double gb = bytesPerSec / (1024.0 * 1024.0 * 1024.0);
+        if (gb >= 10.0) {
+            swprintf(outBuf, bufLen, L"%.1f GB/s", gb);
+        } else {
+            swprintf(outBuf, bufLen, L"%.2f GB/s", gb);
+        }
+    } else {
+        double mb = bytesPerSec / (1024.0 * 1024.0);
+        if (mb >= 100.0) {
+            swprintf(outBuf, bufLen, L"%.0f MB/s", mb);
+        } else if (mb >= 10.0) {
+            swprintf(outBuf, bufLen, L"%.1f MB/s", mb);
+        } else {
+            swprintf(outBuf, bufLen, L"%.2f MB/s", mb);
+        }
+    }
 }
 
 static void AddRoundedRect(GraphicsPath& path, REAL x, REAL y, REAL w, REAL h, REAL radius) {
@@ -1080,8 +1201,20 @@ static void DrawHIconInGraphics(Graphics& g, HICON hIcon, int x, int y, int size
     }
 }
 
+static void FixClearTypeAlpha(void* pBits, int w, int h) {
+    if (!pBits || w <= 0 || h <= 0) return;
+    uint32_t* px = static_cast<uint32_t*>(pBits);
+    size_t count = static_cast<size_t>(w) * static_cast<size_t>(h);
+    for (size_t i = 0; i < count; i++) {
+        uint32_t c = px[i];
+        if ((c >> 24) == 0 && (c & 0x00FFFFFF) != 0) {
+            px[i] = c | 0xFF000000u;
+        }
+    }
+}
+
 // ============================================================================
-// 1. TASKBAR PILL RENDERER (Authentic Warm Dark Design + RAM App Icons)
+// 1. TASKBAR PILL RENDERER (Authentic Claude Warm Dark Design + RAM App Icons)
 // ============================================================================
 static void RenderHud(HWND hwnd) {
     HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -1116,19 +1249,21 @@ static void RenderHud(HWND hwnd) {
     std::vector<float> spark;
     double todayWh = 0, todayEur = 0, todaySec = 0, todayPeakW = 0;
     double monthWh = 0, monthEur = 0, monthSec = 0;
+    int netUnit = NET_UNIT_MB;
     {
         std::lock_guard<std::mutex> lock(g_dataMutex);
         d = g_data;
         spark.assign(g_wattHistory.begin(), g_wattHistory.end());
         GetTodayAndMonthStats(todayWh, todayEur, todaySec, todayPeakW, monthWh, monthEur, monthSec);
+        netUnit = g_log.netUnitMode;
     }
     if (!d.valid) return;
 
     wchar_t sWallW[32], sCpuW[32], sCpuTemp[32], sCpuGhz[32];
     wchar_t sGpuW[32], sGpuTemp[32], sGpuLoad[32];
-    wchar_t sRamGb[32], sRamPct[32], sMonthEur[32];
+    wchar_t sRamGb[32], sRamPct[32], sNetVal[32], sMonthEur[32];
 
-    swprintf(sWallW, 32, L"%.0f W", d.wallAcW);
+    swprintf(sWallW, 32, L"%.0fW", d.wallAcW);
     swprintf(sCpuW,  32, L"%.0fW", d.cpuPptW);
     if (d.cpuThermalThrottle) {
         swprintf(sCpuTemp, 32, L"\x26A0 %.0f\x00B0" L"C", d.cpuTempC);
@@ -1143,58 +1278,65 @@ static void RenderHud(HWND hwnd) {
 
     swprintf(sRamGb,   32, L"%.1fG", d.ramUsedGb);
     swprintf(sRamPct,  32, L"%d%%", d.ramUsedPct);
-    swprintf(sMonthEur, 32, L"%.2f \x20AC", monthEur);
+    FormatNetSpeed(d.netTotalBps, netUnit, sNetVal, 32);
+    swprintf(sMonthEur, 32, L"%.2f\x20AC", monthEur);
 
     HDC hdcScreen = GetDC(nullptr);
-    FontFamily fontFam(L"Segoe UI Variable Display");
-    const FontFamily* pFam = fontFam.IsAvailable() ? &fontFam : FontFamily::GenericSansSerif();
-    Font fontBold(pFam, 9.2f * scale, FontStyleBold, UnitPixel);
-    Font fontMed(pFam,  8.6f * scale, FontStyleRegular, UnitPixel);
-    Font fontTag(pFam,  7.6f * scale, FontStyleBold, UnitPixel);
+    FontFamily fontFam(L"Segoe UI Variable Text");
+    FontFamily fontFallback(L"Segoe UI");
+    const FontFamily* pFam = fontFam.IsAvailable() ? &fontFam : (fontFallback.IsAvailable() ? &fontFallback : FontFamily::GenericSansSerif());
+    Font fontBold(pFam, std::round(9.5f * scale), FontStyleBold, UnitPixel);
+    Font fontMed(pFam,  std::round(8.8f * scale), FontStyleBold, UnitPixel);
+    Font fontTag(pFam,  std::round(7.8f * scale), FontStyleBold, UnitPixel);
 
-    REAL c1W = 0, c2W = 0, c3W = 0, c4W = 0, c5W = 0;
-    REAL sparkW = 34.0f * scale;
-    REAL badgePadX = 6.0f * scale;
+    REAL c1W = 0, c2W = 0, c3W = 0, c4W = 0, cNetW = 0, c5W = 0;
+    REAL sparkW = std::round(20.0f * scale);
+    REAL badgePadX = std::round(3.8f * scale);
 
     RectF bWallW, bCpuLbl, bCpuW, bCpuTemp, bCpuGhz;
     RectF bGpuLbl, bGpuW, bGpuTemp, bGpuLoad;
-    RectF bRamLbl, bRamGb, bRamPct, bEur;
+    RectF bRamLbl, bRamGb, bRamPct, bNetVal, bEur;
 
     {
         Graphics gMeasure(hdcScreen);
-        gMeasure.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        gMeasure.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
         PointF origin(0, 0);
-        gMeasure.MeasureString(sWallW, -1, &fontBold, origin, &bWallW);
+        // Fixed reference templates so card widths & internal positions NEVER jitter
+        gMeasure.MeasureString(L"288W", -1, &fontBold, origin, &bWallW);
 
         gMeasure.MeasureString(L"CPU", -1, &fontTag, origin, &bCpuLbl);
-        gMeasure.MeasureString(sCpuW, -1, &fontBold, origin, &bCpuW);
-        gMeasure.MeasureString(sCpuTemp, -1, &fontBold, origin, &bCpuTemp);
-        gMeasure.MeasureString(sCpuGhz, -1, &fontMed, origin, &bCpuGhz);
+        gMeasure.MeasureString(L"108W", -1, &fontBold, origin, &bCpuW);
+        gMeasure.MeasureString(d.cpuThermalThrottle ? L"\x26A0 88\x00B0" L"C" : L"88\x00B0" L"C", -1, &fontBold, origin, &bCpuTemp);
+        gMeasure.MeasureString(L"4.88G", -1, &fontMed, origin, &bCpuGhz);
 
         gMeasure.MeasureString(L"GPU", -1, &fontTag, origin, &bGpuLbl);
-        gMeasure.MeasureString(sGpuW, -1, &fontBold, origin, &bGpuW);
-        gMeasure.MeasureString(sGpuTemp, -1, &fontBold, origin, &bGpuTemp);
-        gMeasure.MeasureString(sGpuLoad, -1, &fontMed, origin, &bGpuLoad);
+        gMeasure.MeasureString(L"188W", -1, &fontBold, origin, &bGpuW);
+        gMeasure.MeasureString(L"88\x00B0" L"C", -1, &fontBold, origin, &bGpuTemp);
+        gMeasure.MeasureString(L"99%", -1, &fontMed, origin, &bGpuLoad);
 
         gMeasure.MeasureString(L"RAM", -1, &fontTag, origin, &bRamLbl);
-        gMeasure.MeasureString(sRamGb, -1, &fontBold, origin, &bRamGb);
-        gMeasure.MeasureString(sRamPct, -1, &fontBold, origin, &bRamPct);
+        gMeasure.MeasureString(L"28.8G", -1, &fontBold, origin, &bRamGb);
+        gMeasure.MeasureString(L"88%", -1, &fontBold, origin, &bRamPct);
 
-        gMeasure.MeasureString(sMonthEur, -1, &fontBold, origin, &bEur);
+        const wchar_t* netRef = (netUnit == NET_UNIT_MBIT) ? L"88.88 Mbit/s"
+                              : ((netUnit == NET_UNIT_GB)  ? L"0.88 GB/s" : L"88.88 MB/s");
+        gMeasure.MeasureString(netRef, -1, &fontBold, origin, &bNetVal);
+        gMeasure.MeasureString((monthEur >= 10.0) ? L"28.88\x20AC" : L"8.88\x20AC", -1, &fontBold, origin, &bEur);
     }
 
-    c1W = (18.0f * scale) + bWallW.Width + (6.0f * scale) + sparkW + (10.0f * scale);
-    c2W = (10.0f * scale) + bCpuLbl.Width + (4.0f * scale) + bCpuW.Width + (5.0f * scale)
-          + (bCpuTemp.Width + badgePadX * 2.0f) + (5.0f * scale) + bCpuGhz.Width + (9.0f * scale);
-    c3W = (10.0f * scale) + bGpuLbl.Width + (4.0f * scale) + bGpuW.Width + (5.0f * scale)
-          + (bGpuTemp.Width + badgePadX * 2.0f) + (5.0f * scale) + bGpuLoad.Width + (9.0f * scale);
-    c4W = (10.0f * scale) + bRamLbl.Width + (4.0f * scale) + bRamGb.Width + (5.0f * scale)
-          + (bRamPct.Width + badgePadX * 1.6f) + (9.0f * scale);
-    c5W = (20.0f * scale) + bEur.Width + (9.0f * scale);
+    c1W   = std::round((14.0f * scale) + bWallW.Width + (3.0f * scale) + sparkW + (6.0f * scale));
+    c2W   = std::round((6.0f * scale) + bCpuLbl.Width + (1.8f * scale) + bCpuW.Width + (2.5f * scale)
+            + (bCpuTemp.Width + badgePadX * 1.5f) + (2.5f * scale) + bCpuGhz.Width + (5.0f * scale));
+    c3W   = std::round((6.0f * scale) + bGpuLbl.Width + (1.8f * scale) + bGpuW.Width + (2.5f * scale)
+            + (bGpuTemp.Width + badgePadX * 1.5f) + (2.5f * scale) + bGpuLoad.Width + (5.0f * scale));
+    c4W   = std::round((6.0f * scale) + bRamLbl.Width + (1.8f * scale) + bRamGb.Width + (2.5f * scale)
+            + (bRamPct.Width + badgePadX * 1.2f) + (5.0f * scale));
+    cNetW = std::round((16.5f * scale) + bNetVal.Width + (5.0f * scale));
+    c5W   = std::round((16.0f * scale) + bEur.Width + (5.0f * scale));
 
-    REAL outerPadX = 5.0f * scale;
-    REAL cardGap   = 4.0f * scale;
-    int pillW = (int)std::ceil(outerPadX * 2.0f + c1W + c2W + c3W + c4W + c5W + cardGap * 4.0f);
+    REAL outerPadX = std::round(3.5f * scale);
+    REAL cardGap   = std::round(2.8f * scale);
+    int pillW = (int)std::ceil(outerPadX * 2.0f + c1W + c2W + c3W + c4W + cNetW + c5W + cardGap * 5.0f);
 
     int rightGapPx = (int)std::round((float)g_settings.rightMarginDip * scale);
     int posX = rcNotify.left - pillW - rightGapPx;
@@ -1217,27 +1359,29 @@ static void RenderHud(HWND hwnd) {
 
     {
         Graphics g(hdcMem);
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        g.SetSmoothingMode(SmoothingModeHighQuality);
+        g.SetCompositingQuality(CompositingQualityHighQuality);
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        g.SetTextContrast(4);
         g.Clear(Color(0, 0, 0, 0));
 
-        // Authentic Warm Obsidian Outer Container (#191918)
+        // Authentic Claude Warm Obsidian Outer Container (#191918)
         GraphicsPath outerPath;
         AddRoundedRect(outerPath, 0.5f, 0.5f, (REAL)pillW - 1.0f, (REAL)pillH - 1.0f, 6.5f * scale);
-        SolidBrush outerBg(Color((BYTE)g_settings.pillOpacity, 25, 25, 24));
+        SolidBrush outerBg(Color(255, 25, 25, 24));
         g.FillPath(&outerBg, &outerPath);
 
         Pen outerBorder(g_flyoutVisible ? Color(245, 217, 119, 87) : Color(220, 62, 59, 54), 1.2f * scale);
         g.DrawPath(&outerBorder, &outerPath);
 
-        // Warm Palette Brushes
-        SolidBrush brTextPrimary(Color(255, 245, 244, 239)); // #F5F4EF Warm Parchment
-        SolidBrush brTextMuted(Color(240, 172, 167, 158));   // #ACA79E Warm Stone
+        // Claude Warm Palette Brushes
+        SolidBrush brTextPrimary(Color(255, 250, 249, 245)); // Crisp High-Contrast Parchment
+        SolidBrush brTextMuted(Color(255, 195, 190, 182));   // Crisp Warm Stone
         SolidBrush brGold(Color(255, 245, 185, 65));         // Electric Warm Gold
         SolidBrush brCpuTag(Color(255, 95, 228, 168));       // Mint
         SolidBrush brGpuTag(Color(255, 196, 152, 255));      // Lavender
         SolidBrush brRamTag(Color(255, 112, 200, 255));      // Sky
-        SolidBrush brAccentTerra(Color(255, 217, 119, 87));  // #D97757 Warm Terracotta
+        SolidBrush brClaudeTerra(Color(255, 217, 119, 87));  // #D97757 Claude Terracotta
 
         StringFormat sfLeft;
         sfLeft.SetAlignment(StringAlignmentNear);
@@ -1249,10 +1393,12 @@ static void RenderHud(HWND hwnd) {
         sfCenter.SetLineAlignment(StringAlignmentCenter);
         sfCenter.SetFormatFlags(StringFormatFlagsNoWrap);
 
-        REAL cardY = 3.0f * scale;
-        REAL cardH = (REAL)pillH - 6.0f * scale;
+        REAL cardY = std::round(3.0f * scale);
+        REAL cardH = (REAL)pillH - cardY * 2.0f;
         REAL curX  = outerPadX;
-        REAL midY  = (REAL)pillH * 0.48f;
+        REAL midY  = std::round((REAL)pillH * 0.48f);
+        REAL txtBoxY = std::round(midY - 11.0f * scale);
+        REAL txtBoxH = std::round(22.0f * scale);
 
         auto drawMicroCard = [&](int idx, REAL x, REAL w, Color barColor, double loadRatio) {
             g_cardRectsLocal[idx] = {(LONG)x, 0, (LONG)(x + w), pillH};
@@ -1260,45 +1406,45 @@ static void RenderHud(HWND hwnd) {
 
             GraphicsPath cp;
             AddRoundedRect(cp, x, cardY, w, cardH, 4.5f * scale);
-            SolidBrush cb(isHov ? Color(252, 48, 45, 41) : Color(242, 36, 35, 33));
+            SolidBrush cb(isHov ? Color(255, 48, 45, 41) : Color(255, 36, 35, 33));
             g.FillPath(&cb, &cp);
 
-            Pen cPen(isHov ? Color(245, 217, 119, 87) : Color(185, 58, 55, 50), isHov ? 1.3f * scale : 1.0f);
+            Pen cPen(isHov ? Color(245, 217, 119, 87) : Color(195, 58, 55, 50), isHov ? 1.3f * scale : 1.0f);
             g.DrawPath(&cPen, &cp);
 
-            REAL barMargin = 5.0f * scale;
+            REAL barMargin = 4.0f * scale;
             REAL maxBarW = w - barMargin * 2.0f;
             if (maxBarW > 4.0f) {
                 if (loadRatio < 0.04) loadRatio = 0.04;
                 if (loadRatio > 1.0) loadRatio = 1.0;
                 REAL fillW = (REAL)(maxBarW * loadRatio);
-                REAL barY = cardY + cardH - 2.6f * scale;
-                SolidBrush brTrack(Color(110, 20, 20, 19));
-                g.FillRectangle(&brTrack, x + barMargin, barY, maxBarW, 1.8f * scale);
+                REAL barY = cardY + cardH - 2.5f * scale;
+                SolidBrush brTrack(Color(150, 20, 20, 19));
+                g.FillRectangle(&brTrack, x + barMargin, barY, maxBarW, 1.7f * scale);
                 SolidBrush brFill(barColor);
-                g.FillRectangle(&brFill, x + barMargin, barY, fillW, 1.8f * scale);
+                g.FillRectangle(&brFill, x + barMargin, barY, fillW, 1.7f * scale);
             }
         };
 
         // --- CARD 0: WALL POWER + SPARKLINE ---
         drawMicroCard(0, curX, c1W, Color(235, 245, 185, 65), d.wallAcW / 550.0);
         {
-            REAL lx = curX + 6.0f * scale;
+            REAL lx = std::round(curX + 4.5f * scale);
             PointF boltPts[6] = {
-                PointF(lx + 5.5f * scale, midY - 6.5f * scale),
+                PointF(lx + 5.0f * scale, midY - 6.0f * scale),
                 PointF(lx + 1.0f * scale, midY + 0.5f * scale),
-                PointF(lx + 4.5f * scale, midY + 0.5f * scale),
-                PointF(lx + 3.0f * scale, midY + 6.5f * scale),
-                PointF(lx + 8.5f * scale, midY - 1.0f * scale),
-                PointF(lx + 5.0f * scale, midY - 1.0f * scale)
+                PointF(lx + 4.2f * scale, midY + 0.5f * scale),
+                PointF(lx + 2.8f * scale, midY + 6.0f * scale),
+                PointF(lx + 7.8f * scale, midY - 1.0f * scale),
+                PointF(lx + 4.6f * scale, midY - 1.0f * scale)
             };
             g.FillPolygon(&brGold, boltPts, 6);
-            lx += 11.0f * scale;
+            lx = std::round(lx + 9.2f * scale);
 
-            g.DrawString(sWallW, -1, &fontBold, PointF(lx, midY), &sfLeft, &brTextPrimary);
-            lx += bWallW.Width + 4.0f * scale;
+            g.DrawString(sWallW, -1, &fontBold, RectF(lx, txtBoxY, bWallW.Width, txtBoxH), &sfCenter, &brTextPrimary);
+            lx = std::round(lx + bWallW.Width + 2.8f * scale);
 
-            REAL spH = 12.0f * scale;
+            REAL spH = 11.0f * scale;
             REAL spY = midY - spH * 0.5f;
             if (spark.size() >= 2) {
                 float minW = 70.0f, maxW = 280.0f;
@@ -1319,7 +1465,7 @@ static void RenderHud(HWND hwnd) {
                     float py = (spY + spH) - norm * spH;
                     pts.push_back(PointF(px, py));
                 }
-                Pen sparkPen(Color(245, 245, 185, 65), 1.4f * scale);
+                Pen sparkPen(Color(245, 245, 185, 65), 1.3f * scale);
                 g.DrawLines(&sparkPen, pts.data(), (INT)pts.size());
             }
         }
@@ -1330,27 +1476,27 @@ static void RenderHud(HWND hwnd) {
         GetTempBadgeColors(d.cpuTempC, cpuBg, cpuBorder, cpuText);
         drawMicroCard(1, curX, c2W, cpuBorder, d.cpuPptW / 135.0);
         {
-            REAL lx = curX + 7.0f * scale;
+            REAL lx = std::round(curX + 5.0f * scale);
             g.DrawString(L"CPU", -1, &fontTag, PointF(lx, midY), &sfLeft, &brCpuTag);
-            lx += bCpuLbl.Width + 3.0f * scale;
+            lx = std::round(lx + bCpuLbl.Width + 1.8f * scale);
 
-            g.DrawString(sCpuW, -1, &fontBold, PointF(lx, midY), &sfLeft, &brTextPrimary);
-            lx += bCpuW.Width + 4.0f * scale;
+            g.DrawString(sCpuW, -1, &fontBold, RectF(lx, txtBoxY, bCpuW.Width, txtBoxH), &sfCenter, &brTextPrimary);
+            lx = std::round(lx + bCpuW.Width + 2.5f * scale);
 
-            REAL bw = bCpuTemp.Width + badgePadX * 1.8f;
-            REAL bh = 15.0f * scale;
-            REAL by = midY - bh * 0.5f;
+            REAL bw = std::round(bCpuTemp.Width + badgePadX * 1.5f);
+            REAL bh = std::round(15.0f * scale);
+            REAL by = std::round(midY - bh * 0.5f);
             GraphicsPath bp;
-            AddRoundedRect(bp, lx, by, bw, bh, 4.0f * scale);
-            SolidBrush bBrush(cpuBg);
+            AddRoundedRect(bp, lx, by, bw, bh, 3.8f * scale);
+            SolidBrush bBrush(Color(255, cpuBg.GetR(), cpuBg.GetG(), cpuBg.GetB()));
             Pen bPen(cpuBorder, 1.0f * scale);
             g.FillPath(&bBrush, &bp);
             g.DrawPath(&bPen, &bp);
             SolidBrush bTxt(cpuText);
             g.DrawString(sCpuTemp, -1, &fontBold, RectF(lx, by, bw, bh), &sfCenter, &bTxt);
-            lx += bw + 4.5f * scale;
+            lx = std::round(lx + bw + 2.5f * scale);
 
-            g.DrawString(sCpuGhz, -1, &fontMed, PointF(lx, midY), &sfLeft, &brTextMuted);
+            g.DrawString(sCpuGhz, -1, &fontMed, RectF(lx, txtBoxY, bCpuGhz.Width, txtBoxH), &sfCenter, &brTextMuted);
         }
         curX += c2W + cardGap;
 
@@ -1359,47 +1505,47 @@ static void RenderHud(HWND hwnd) {
         GetTempBadgeColors((double)d.gpuTempC, gpuBg, gpuBorder, gpuText);
         drawMicroCard(2, curX, c3W, Color(235, 186, 135, 255), (double)d.gpuBoardW / 330.0);
         {
-            REAL lx = curX + 7.0f * scale;
+            REAL lx = std::round(curX + 5.0f * scale);
             g.DrawString(L"GPU", -1, &fontTag, PointF(lx, midY), &sfLeft, &brGpuTag);
-            lx += bGpuLbl.Width + 3.0f * scale;
+            lx = std::round(lx + bGpuLbl.Width + 1.8f * scale);
 
-            g.DrawString(sGpuW, -1, &fontBold, PointF(lx, midY), &sfLeft, &brTextPrimary);
-            lx += bGpuW.Width + 4.0f * scale;
+            g.DrawString(sGpuW, -1, &fontBold, RectF(lx, txtBoxY, bGpuW.Width, txtBoxH), &sfCenter, &brTextPrimary);
+            lx = std::round(lx + bGpuW.Width + 2.5f * scale);
 
-            REAL bw = bGpuTemp.Width + badgePadX * 1.8f;
-            REAL bh = 15.0f * scale;
-            REAL by = midY - bh * 0.5f;
+            REAL bw = std::round(bGpuTemp.Width + badgePadX * 1.5f);
+            REAL bh = std::round(15.0f * scale);
+            REAL by = std::round(midY - bh * 0.5f);
             GraphicsPath bp;
-            AddRoundedRect(bp, lx, by, bw, bh, 4.0f * scale);
-            SolidBrush bBrush(gpuBg);
+            AddRoundedRect(bp, lx, by, bw, bh, 3.8f * scale);
+            SolidBrush bBrush(Color(255, gpuBg.GetR(), gpuBg.GetG(), gpuBg.GetB()));
             Pen bPen(gpuBorder, 1.0f * scale);
             g.FillPath(&bBrush, &bp);
             g.DrawPath(&bPen, &bp);
             SolidBrush bTxt(gpuText);
             g.DrawString(sGpuTemp, -1, &fontBold, RectF(lx, by, bw, bh), &sfCenter, &bTxt);
-            lx += bw + 4.5f * scale;
+            lx = std::round(lx + bw + 2.5f * scale);
 
-            g.DrawString(sGpuLoad, -1, &fontMed, PointF(lx, midY), &sfLeft, &brTextMuted);
+            g.DrawString(sGpuLoad, -1, &fontMed, RectF(lx, txtBoxY, bGpuLoad.Width, txtBoxH), &sfCenter, &brTextMuted);
         }
         curX += c3W + cardGap;
 
         // --- CARD 3: RAM (Clean & Minimalist) ---
         drawMicroCard(3, curX, c4W, Color(235, 95, 195, 255), (double)d.ramUsedPct / 100.0);
         {
-            REAL lx = curX + 7.0f * scale;
+            REAL lx = std::round(curX + 5.0f * scale);
             g.DrawString(L"RAM", -1, &fontTag, PointF(lx, midY), &sfLeft, &brRamTag);
-            lx += bRamLbl.Width + 3.0f * scale;
+            lx = std::round(lx + bRamLbl.Width + 1.8f * scale);
 
-            g.DrawString(sRamGb, -1, &fontBold, PointF(lx, midY), &sfLeft, &brTextPrimary);
-            lx += bRamGb.Width + 4.0f * scale;
+            g.DrawString(sRamGb, -1, &fontBold, RectF(lx, txtBoxY, bRamGb.Width, txtBoxH), &sfCenter, &brTextPrimary);
+            lx = std::round(lx + bRamGb.Width + 2.5f * scale);
 
-            REAL bw = bRamPct.Width + badgePadX * 1.4f;
-            REAL bh = 15.0f * scale;
-            REAL by = midY - bh * 0.5f;
+            REAL bw = std::round(bRamPct.Width + badgePadX * 1.2f);
+            REAL bh = std::round(15.0f * scale);
+            REAL by = std::round(midY - bh * 0.5f);
             GraphicsPath bp;
-            AddRoundedRect(bp, lx, by, bw, bh, 4.0f * scale);
-            SolidBrush bBrush(Color(175, 14, 52, 82));
-            Pen bPen(Color(215, 56, 189, 248), 1.0f * scale);
+            AddRoundedRect(bp, lx, by, bw, bh, 3.8f * scale);
+            SolidBrush bBrush(Color(255, 14, 52, 82));
+            Pen bPen(Color(235, 56, 189, 248), 1.0f * scale);
             g.FillPath(&bBrush, &bp);
             g.DrawPath(&bPen, &bp);
             SolidBrush bTxt(Color(255, 165, 230, 255));
@@ -1407,19 +1553,44 @@ static void RenderHud(HWND hwnd) {
         }
         curX += c4W + cardGap;
 
-        // --- CARD 4: MONTHLY EURO + CHART ICON ---
-        drawMicroCard(4, curX, c5W, Color(245, 217, 119, 87), (std::min)(1.0, monthEur / 15.0 + 0.15));
+        // --- CARD 4: WIFI / NETWORK SPEED ---
+        double netBarRatio = (d.netTotalBps * 8.0) / 100000000.0; // full bar at 100 Mbps+
+        drawMicroCard(4, curX, cNetW, Color(235, 45, 212, 191), netBarRatio);
         {
-            REAL lx = curX + 6.5f * scale;
-            REAL iconBaseY = midY + 5.0f * scale;
-            g.FillRectangle(&brAccentTerra, lx, iconBaseY - 4.5f * scale, 2.5f * scale, 4.5f * scale);
-            g.FillRectangle(&brAccentTerra, lx + 3.5f * scale, iconBaseY - 7.5f * scale, 2.5f * scale, 7.5f * scale);
-            g.FillRectangle(&brAccentTerra, lx + 7.0f * scale, iconBaseY - 10.5f * scale, 2.5f * scale, 10.5f * scale);
-            lx += 12.5f * scale;
+            REAL lx = std::round(curX + 5.0f * scale);
+            REAL wCx = lx + 4.8f * scale;
+            REAL wCy = midY + 3.6f * scale;
+            SolidBrush brWifi(Color(255, 45, 212, 191));
+            Pen penWifi(Color(255, 45, 212, 191), 1.35f * scale);
+            penWifi.SetStartCap(LineCapRound);
+            penWifi.SetEndCap(LineCapRound);
 
-            g.DrawString(sMonthEur, -1, &fontBold, PointF(lx, midY), &sfLeft, &brTextPrimary);
+            g.FillEllipse(&brWifi, wCx - 1.2f * scale, wCy - 1.2f * scale, 2.4f * scale, 2.4f * scale);
+            REAL r1 = 3.4f * scale;
+            REAL r2 = 6.1f * scale;
+            g.DrawArc(&penWifi, wCx - r1, wCy - r1, r1 * 2.0f, r1 * 2.0f, 225.0f, 90.0f);
+            g.DrawArc(&penWifi, wCx - r2, wCy - r2, r2 * 2.0f, r2 * 2.0f, 225.0f, 90.0f);
+            lx = std::round(lx + 11.0f * scale);
+
+            g.DrawString(sNetVal, -1, &fontBold, RectF(lx, txtBoxY, bNetVal.Width, txtBoxH), &sfCenter, &brTextPrimary);
+        }
+        curX += cNetW + cardGap;
+
+        // --- CARD 5: MONTHLY EURO + CHART ICON ---
+        drawMicroCard(5, curX, c5W, Color(245, 217, 119, 87), (std::min)(1.0, monthEur / 15.0 + 0.15));
+        {
+            REAL lx = std::round(curX + 5.0f * scale);
+            REAL iconBaseY = midY + 4.5f * scale;
+            g.FillRectangle(&brClaudeTerra, lx, iconBaseY - 4.0f * scale, 2.2f * scale, 4.0f * scale);
+            g.FillRectangle(&brClaudeTerra, lx + 3.1f * scale, iconBaseY - 6.8f * scale, 2.2f * scale, 6.8f * scale);
+            g.FillRectangle(&brClaudeTerra, lx + 6.2f * scale, iconBaseY - 9.5f * scale, 2.2f * scale, 9.5f * scale);
+            lx = std::round(lx + 10.2f * scale);
+
+            g.DrawString(sMonthEur, -1, &fontBold, RectF(lx, txtBoxY, bEur.Width, txtBoxH), &sfCenter, &brTextPrimary);
         }
     }
+
+    FixClearTypeAlpha(pBits, pillW, pillH);
 
     if (GetParent(hwnd) != hTray) {
         SetParent(hwnd, hTray);
@@ -1431,7 +1602,7 @@ static void RenderHud(HWND hwnd) {
     SIZE sizeWnd = {pillW, pillH};
     BLENDFUNCTION blend = {};
     blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
+    blend.SourceConstantAlpha = (BYTE)g_settings.pillOpacity;
     blend.AlphaFormat = AC_SRC_ALPHA;
 
     UpdateLayeredWindow(hwnd, hdcScreen, &ptDst, &sizeWnd, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
@@ -1447,11 +1618,11 @@ static void RenderHud(HWND hwnd) {
 }
 
 // ============================================================================
-// 2. ULTRA-MINIMALIST POWER HOVER CAPSULE (Top-3 App Icon + Name + Live Numbers)
+// 2. ULTRA-MINIMALIST CLAUDE HOVER CAPSULE (Top-3 App Icon + Name / WiFi Unit Picker)
 // ============================================================================
 static void RenderHoverCard(HWND hwnd) {
     if (g_flyoutVisible || g_hoverAnimProgress <= 0.02f ||
-        (g_activeHoverIdx != 1 && g_activeHoverIdx != 2 && g_activeHoverIdx != 3)) {
+        (g_activeHoverIdx < 1 || g_activeHoverIdx > 4)) {
         ShowWindow(hwnd, SW_HIDE);
         return;
     }
@@ -1465,38 +1636,27 @@ static void RenderHoverCard(HWND hwnd) {
     float t = g_hoverAnimProgress;
     float ease = 1.0f - std::pow(1.0f - t, 3.0f);
     BYTE masterAlpha = (BYTE)std::round(255.0f * ease);
-    auto scA = [&](int a) -> BYTE { return (BYTE)((a * (int)masterAlpha) / 255); };
 
-    int wndW = (int)std::round(224.0f * scale);
-    int wndH = (int)std::round(104.0f * scale);
+    int wndW = (int)std::round(206.0f * scale);
+    int wndH = (int)std::round(92.0f * scale);
 
-    // Center directly above the active CPU / GPU / RAM card
+    // Center directly above the active CPU / GPU / RAM / WiFi card
     int targetX = (int)std::round(g_hoverAnimCenterX - wndW * 0.5f);
     if (targetX < 20) targetX = 20;
     if (targetX + wndW > 3820) targetX = 3820 - wndW;
 
-    int slideOffsetPx = (int)std::round((1.0f - ease) * 12.0f * scale);
-    int targetY = g_lastPillScreenRect.top - wndH - (int)std::round(8.0f * scale) + slideOffsetPx;
+    int slideOffsetPx = (int)std::round((1.0f - ease) * 10.0f * scale);
+    int targetY = g_lastPillScreenRect.top - wndH - (int)std::round(6.0f * scale) + slideOffsetPx;
+    g_lastHoverScreenRect = {targetX, targetY, targetX + wndW, targetY + wndH};
 
     TelemetryData d;
+    int netUnit = NET_UNIT_MB;
     {
         std::lock_guard<std::mutex> lock(g_dataMutex);
         d = g_data;
+        netUnit = g_log.netUnitMode;
     }
     if (!d.valid) return;
-
-    const std::vector<TopAppEntry>* pApps = nullptr;
-    Color barCol(scA(240), 56, 189, 248);
-    if (g_activeHoverIdx == 1) {
-        pApps = &d.topCpuApps;
-        barCol = Color(scA(240), 16, 185, 129);
-    } else if (g_activeHoverIdx == 2) {
-        pApps = &d.topGpuApps;
-        barCol = Color(scA(240), 186, 135, 255);
-    } else {
-        pApps = &d.topRamApps;
-        barCol = Color(scA(240), 56, 189, 248);
-    }
 
     HDC hdcScreen = GetDC(nullptr);
     HDC hdcMem = CreateCompatibleDC(hdcScreen);
@@ -1514,32 +1674,35 @@ static void RenderHoverCard(HWND hwnd) {
 
     {
         Graphics g(hdcMem);
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        g.SetSmoothingMode(SmoothingModeHighQuality);
+        g.SetCompositingQuality(CompositingQualityHighQuality);
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        g.SetTextContrast(4);
         g.Clear(Color(0, 0, 0, 0));
 
-        FontFamily fontFam(L"Segoe UI Variable Display");
-        const FontFamily* pFam = fontFam.IsAvailable() ? &fontFam : FontFamily::GenericSansSerif();
-        Font fName(pFam, 8.8f * scale, FontStyleBold, UnitPixel);
-        Font fVal(pFam,  8.8f * scale, FontStyleBold, UnitPixel);
+        FontFamily fontFam(L"Segoe UI Variable Text");
+        FontFamily fontFallback(L"Segoe UI");
+        const FontFamily* pFam = fontFam.IsAvailable() ? &fontFam : (fontFallback.IsAvailable() ? &fontFallback : FontFamily::GenericSansSerif());
+        Font fName(pFam, std::round(9.2f * scale), FontStyleBold, UnitPixel);
+        Font fVal(pFam,  std::round(9.0f * scale), FontStyleBold, UnitPixel);
 
-        // Minimalist Warm Obsidian Capsule (#191918)
+        // Minimalist Claude Warm Obsidian Capsule (#191918)
         GraphicsPath bgPath;
-        AddRoundedRect(bgPath, 1.0f, 1.0f, (REAL)wndW - 2.0f, (REAL)wndH - 2.0f, 9.0f * scale);
-        SolidBrush brBg(Color(scA(248), 25, 25, 24));
+        AddRoundedRect(bgPath, 1.0f, 1.0f, (REAL)wndW - 2.0f, (REAL)wndH - 2.0f, 7.5f * scale);
+        SolidBrush brBg(Color(255, 25, 25, 24));
         g.FillPath(&brBg, &bgPath);
 
-        Pen penBorder(Color(scA(225), 217, 119, 87), 1.2f * scale);
+        Pen penBorder(Color(240, 217, 119, 87), 1.1f * scale);
         g.DrawPath(&penBorder, &bgPath);
 
-        SolidBrush brWhite(Color(scA(255), 245, 244, 239));
-        SolidBrush brMuted(Color(scA(245), 205, 200, 190));
-        SolidBrush brCard(Color(scA(235), 36, 35, 33));
-        Pen penCard(Color(scA(170), 58, 55, 50), 1.0f);
+        SolidBrush brWhite(Color(255, 250, 249, 245));
+        SolidBrush brMuted(Color(255, 212, 208, 200));
+        SolidBrush brCard(Color(255, 36, 35, 33));
+        Pen penCard(Color(195, 58, 55, 50), 1.0f);
 
-        REAL pad  = 6.5f * scale;
+        REAL pad  = std::round(5.0f * scale);
         REAL curY = pad;
-        REAL rowH = 28.0f * scale;
+        REAL rowH = std::round(25.0f * scale);
         REAL rowW = (REAL)wndW - pad * 2.0f;
 
         StringFormat sfLeft;
@@ -1553,69 +1716,155 @@ static void RenderHoverCard(HWND hwnd) {
         sfRight.SetLineAlignment(StringAlignmentCenter);
         sfRight.SetFormatFlags(StringFormatFlagsNoWrap);
 
-        int count = pApps ? (int)(std::min)((size_t)3, pApps->size()) : 0;
-        for (int i = 0; i < count; i++) {
-            const auto& app = (*pApps)[i];
-            GraphicsPath rp;
-            AddRoundedRect(rp, pad, curY, rowW, rowH, 5.5f * scale);
-            g.FillPath(&brCard, &rp);
-            g.DrawPath(&penCard, &rp);
+        StringFormat sfCenter;
+        sfCenter.SetAlignment(StringAlignmentCenter);
+        sfCenter.SetLineAlignment(StringAlignmentCenter);
+        sfCenter.SetFormatFlags(StringFormatFlagsNoWrap);
 
-            int icoSz = (int)std::round(18.0f * scale);
-            int icoX  = (int)std::round(pad + 6.5f * scale);
-            int icoY  = (int)std::round(curY + (rowH - icoSz) * 0.5f);
-            if (masterAlpha > 90) {
-                DrawHIconInGraphics(g, app.hIcon, icoX, icoY, icoSz);
+        if (g_activeHoverIdx == 4) {
+            // --- WIFI / NETWORK HOVER CAPSULE (Download, Upload & MB/s / Mbit/s / GB/s Selector) ---
+            for (int r = 0; r < 2; r++) {
+                GraphicsPath rp;
+                AddRoundedRect(rp, pad, curY, rowW, rowH, 4.5f * scale);
+                g.FillPath(&brCard, &rp);
+                g.DrawPath(&penCard, &rp);
+
+                REAL badgeSz = std::round(16.0f * scale);
+                REAL badgeX  = std::round(pad + 5.0f * scale);
+                REAL badgeY  = std::round(curY + (rowH - badgeSz) * 0.5f);
+                GraphicsPath bp;
+                AddRoundedRect(bp, badgeX, badgeY, badgeSz, badgeSz, 3.8f * scale);
+
+                Color bFillCol = (r == 0) ? Color(255, 10, 68, 62) : Color(255, 14, 52, 82);
+                Color bPenCol  = (r == 0) ? Color(255, 45, 212, 191) : Color(255, 56, 189, 248);
+                SolidBrush bFill(bFillCol);
+                Pen bPen(bPenCol, 1.0f * scale);
+                g.FillPath(&bFill, &bp);
+                g.DrawPath(&bPen, &bp);
+                SolidBrush bArrowTxt(bPenCol);
+                g.DrawString((r == 0) ? L"\x2193" : L"\x2191", -1, &fName, RectF(badgeX, badgeY, badgeSz, badgeSz), &sfCenter, &bArrowTxt);
+
+                RectF rcName(std::round(pad + 25.0f * scale), curY, std::round(80.0f * scale), rowH - 2.0f * scale);
+                g.DrawString((r == 0) ? L"Download" : L"Upload", -1, &fName, rcName, &sfLeft, &brWhite);
+
+                wchar_t sRate[32];
+                double bps = (r == 0) ? d.netDownBps : d.netUpBps;
+                FormatNetSpeed(bps, netUnit, sRate, 32);
+                RectF rcTxt(std::round(pad + 86.0f * scale), curY, std::round(rowW - 92.0f * scale), rowH - 2.0f * scale);
+                g.DrawString(sRate, -1, &fVal, rcTxt, &sfRight, &brMuted);
+
+                double barRatio = (bps * 8.0) / 100000000.0;
+                if (barRatio < 0.05) barRatio = 0.05;
+                if (barRatio > 1.0) barRatio = 1.0;
+                REAL barX = std::round(pad + 25.0f * scale);
+                REAL barW = std::round(rowW - 31.0f * scale);
+                REAL barY = std::round(curY + rowH - 3.3f * scale);
+                SolidBrush brTrack(Color(180, 20, 20, 19));
+                g.FillRectangle(&brTrack, barX, barY, barW, 1.8f * scale);
+                SolidBrush brBarFill(bPenCol);
+                g.FillRectangle(&brBarFill, barX, barY, (REAL)(barW * barRatio), 1.8f * scale);
+
+                curY = std::round(curY + rowH + 3.0f * scale);
             }
 
-            // App Name right next to the icon
-            RectF rcName(pad + 29.0f * scale, curY, 96.0f * scale, rowH - 2.5f * scale);
-            g.DrawString(app.name.c_str(), -1, &fName, rcName, &sfLeft, &brWhite);
+            // Row 3: Interactive Unit Selector Pills: [ MB/s ]  [ Mbit/s ]  [ GB/s ]
+            const wchar_t* unitLabels[3] = { L"MB/s", L"Mbit/s", L"GB/s" };
+            REAL btnGap = std::round(4.0f * scale);
+            REAL btnW   = std::round((rowW - btnGap * 2.0f) / 3.0f);
+            for (int u = 0; u < 3; u++) {
+                REAL bx = std::round(pad + u * (btnW + btnGap));
+                g_rcHoverUnitBtns[u] = {(LONG)bx, (LONG)curY, (LONG)(bx + btnW), (LONG)(curY + rowH)};
+                bool isSel = (netUnit == u);
 
-            wchar_t sData[64];
-            double barRatio = 0.1;
-            if (g_activeHoverIdx == 1) { // CPU: % + W
-                swprintf(sData, 64, L"%.1f%% \x00B7 %.0fW", app.valuePrimary, app.valueSecondary);
-                barRatio = app.valuePrimary / 35.0;
-            } else if (g_activeHoverIdx == 2) { // GPU: VRAM + %
-                if (app.valuePrimary >= 1024.0) {
-                    swprintf(sData, 64, L"%.1fG \x00B7 %.0f%%", app.valuePrimary / 1024.0, app.valueSecondary);
-                } else {
-                    swprintf(sData, 64, L"%.0fM \x00B7 %.0f%%", app.valuePrimary, app.valueSecondary);
-                }
-                barRatio = app.valuePrimary / 2048.0;
-            } else { // RAM: GB/MB + %
-                if (app.valuePrimary >= 1024.0) {
-                    swprintf(sData, 64, L"%.2fG \x00B7 %.0f%%", app.valuePrimary / 1024.0, app.valueSecondary);
-                } else {
-                    swprintf(sData, 64, L"%.0fM \x00B7 %.0f%%", app.valuePrimary, app.valueSecondary);
-                }
-                barRatio = app.valuePrimary / 4096.0;
+                GraphicsPath up;
+                AddRoundedRect(up, bx, curY, btnW, rowH, 4.5f * scale);
+                SolidBrush uFill(isSel ? Color(255, 185, 88, 58) : Color(255, 36, 35, 33));
+                Pen uPen(isSel ? Color(255, 238, 142, 108) : Color(195, 68, 64, 58), isSel ? 1.1f * scale : 1.0f);
+                g.FillPath(&uFill, &up);
+                g.DrawPath(&uPen, &up);
+
+                g.DrawString(unitLabels[u], -1, &fName, RectF(bx, curY, btnW, rowH), &sfCenter, isSel ? &brWhite : &brMuted);
+            }
+        } else {
+            const std::vector<TopAppEntry>* pApps = nullptr;
+            Color barCol(255, 56, 189, 248);
+            if (g_activeHoverIdx == 1) {
+                pApps = &d.topCpuApps;
+                barCol = Color(255, 16, 185, 129);
+            } else if (g_activeHoverIdx == 2) {
+                pApps = &d.topGpuApps;
+                barCol = Color(255, 186, 135, 255);
+            } else {
+                pApps = &d.topRamApps;
+                barCol = Color(255, 56, 189, 248);
             }
 
-            RectF rcTxt(pad + 118.0f * scale, curY, rowW - 124.5f * scale, rowH - 2.5f * scale);
-            g.DrawString(sData, -1, &fVal, rcTxt, &sfRight, &brMuted);
+            int count = pApps ? (int)(std::min)((size_t)3, pApps->size()) : 0;
+            for (int i = 0; i < count; i++) {
+                const auto& app = (*pApps)[i];
+                GraphicsPath rp;
+                AddRoundedRect(rp, pad, curY, rowW, rowH, 4.5f * scale);
+                g.FillPath(&brCard, &rp);
+                g.DrawPath(&penCard, &rp);
 
-            if (barRatio < 0.05) barRatio = 0.05;
-            if (barRatio > 1.0) barRatio = 1.0;
-            REAL barX = pad + 29.0f * scale;
-            REAL barW = rowW - 35.5f * scale;
-            REAL barY = curY + rowH - 3.8f * scale;
-            SolidBrush brTrack(Color(scA(130), 20, 20, 19));
-            g.FillRectangle(&brTrack, barX, barY, barW, 2.0f * scale);
-            SolidBrush brFill(barCol);
-            g.FillRectangle(&brFill, barX, barY, (REAL)(barW * barRatio), 2.0f * scale);
+                int icoSz = (int)std::round(16.0f * scale);
+                int icoX  = (int)std::round(pad + 5.5f * scale);
+                int icoY  = (int)std::round(curY + (rowH - icoSz) * 0.5f);
+                if (masterAlpha > 40) {
+                    DrawHIconInGraphics(g, app.hIcon, icoX, icoY, icoSz);
+                }
 
-            curY += rowH + 3.5f * scale;
+                // App Name right next to the icon
+                RectF rcName(std::round(pad + 25.0f * scale), curY, std::round(86.0f * scale), rowH - 2.0f * scale);
+                g.DrawString(app.name.c_str(), -1, &fName, rcName, &sfLeft, &brWhite);
+
+                wchar_t sData[64];
+                double barRatio = 0.1;
+                if (g_activeHoverIdx == 1) { // CPU: % + W
+                    swprintf(sData, 64, L"%.1f%% \x00B7 %.0fW", app.valuePrimary, app.valueSecondary);
+                    barRatio = app.valuePrimary / 35.0;
+                } else if (g_activeHoverIdx == 2) { // GPU: VRAM + %
+                    if (app.valuePrimary >= 1024.0) {
+                        swprintf(sData, 64, L"%.1fG \x00B7 %.0f%%", app.valuePrimary / 1024.0, app.valueSecondary);
+                    } else {
+                        swprintf(sData, 64, L"%.0fM \x00B7 %.0f%%", app.valuePrimary, app.valueSecondary);
+                    }
+                    barRatio = app.valuePrimary / 2048.0;
+                } else { // RAM: GB/MB + %
+                    if (app.valuePrimary >= 1024.0) {
+                        swprintf(sData, 64, L"%.2fG \x00B7 %.0f%%", app.valuePrimary / 1024.0, app.valueSecondary);
+                    } else {
+                        swprintf(sData, 64, L"%.0fM \x00B7 %.0f%%", app.valuePrimary, app.valueSecondary);
+                    }
+                    barRatio = app.valuePrimary / 4096.0;
+                }
+
+                RectF rcTxt(std::round(pad + 104.0f * scale), curY, std::round(rowW - 110.0f * scale), rowH - 2.0f * scale);
+                g.DrawString(sData, -1, &fVal, rcTxt, &sfRight, &brMuted);
+
+                if (barRatio < 0.05) barRatio = 0.05;
+                if (barRatio > 1.0) barRatio = 1.0;
+                REAL barX = std::round(pad + 25.0f * scale);
+                REAL barW = std::round(rowW - 31.0f * scale);
+                REAL barY = std::round(curY + rowH - 3.3f * scale);
+                SolidBrush brTrack(Color(180, 20, 20, 19));
+                g.FillRectangle(&brTrack, barX, barY, barW, 1.8f * scale);
+                SolidBrush brFill(barCol);
+                g.FillRectangle(&brFill, barX, barY, (REAL)(barW * barRatio), 1.8f * scale);
+
+                curY = std::round(curY + rowH + 3.0f * scale);
+            }
         }
     }
+
+    FixClearTypeAlpha(pBits, wndW, wndH);
 
     POINT ptSrc = {0, 0};
     POINT ptDst = {targetX, targetY};
     SIZE sizeWnd = {wndW, wndH};
     BLENDFUNCTION blend = {};
     blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
+    blend.SourceConstantAlpha = masterAlpha;
     blend.AlphaFormat = AC_SRC_ALPHA;
 
     UpdateLayeredWindow(hwnd, hdcScreen, &ptDst, &sizeWnd, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
@@ -1683,23 +1932,26 @@ static void RenderFlyout(HWND hwnd) {
 
     {
         Graphics g(hdcMem);
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        g.SetSmoothingMode(SmoothingModeHighQuality);
+        g.SetCompositingQuality(CompositingQualityHighQuality);
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        g.SetTextContrast(4);
         g.Clear(Color(0, 0, 0, 0));
 
-        FontFamily fontFam(L"Segoe UI Variable Display");
-        const FontFamily* pFam = fontFam.IsAvailable() ? &fontFam : FontFamily::GenericSansSerif();
+        FontFamily fontFam(L"Segoe UI Variable Text");
+        FontFamily fontFallback(L"Segoe UI");
+        const FontFamily* pFam = fontFam.IsAvailable() ? &fontFam : (fontFallback.IsAvailable() ? &fontFallback : FontFamily::GenericSansSerif());
 
-        Font fTitle(pFam,    13.5f * scale, FontStyleBold, UnitPixel);
-        Font fSub(pFam,       9.0f * scale, FontStyleRegular, UnitPixel);
-        Font fKpiLbl(pFam,    8.2f * scale, FontStyleBold, UnitPixel);
-        Font fKpiBig(pFam,   16.0f * scale, FontStyleBold, UnitPixel);
-        Font fKpiSub(pFam,    8.5f * scale, FontStyleRegular, UnitPixel);
-        Font fSecTitle(pFam,  9.2f * scale, FontStyleBold, UnitPixel);
-        Font fAxis(pFam,      7.8f * scale, FontStyleRegular, UnitPixel);
-        Font fBtn(pFam,       8.5f * scale, FontStyleBold, UnitPixel);
+        Font fTitle(pFam,    std::round(14.0f * scale), FontStyleBold, UnitPixel);
+        Font fSub(pFam,      std::round(9.4f * scale),  FontStyleRegular, UnitPixel);
+        Font fKpiLbl(pFam,   std::round(8.6f * scale),  FontStyleBold, UnitPixel);
+        Font fKpiBig(pFam,   std::round(16.5f * scale), FontStyleBold, UnitPixel);
+        Font fKpiSub(pFam,   std::round(8.8f * scale),  FontStyleRegular, UnitPixel);
+        Font fSecTitle(pFam, std::round(9.6f * scale),  FontStyleBold, UnitPixel);
+        Font fAxis(pFam,     std::round(8.2f * scale),  FontStyleRegular, UnitPixel);
+        Font fBtn(pFam,      std::round(8.8f * scale),  FontStyleBold, UnitPixel);
 
-        // Warm Obsidian Window Surface (#191918)
+        // Claude Warm Obsidian Window Surface (#191918)
         GraphicsPath wndPath;
         AddRoundedRect(wndPath, 1.0f, 1.0f, (REAL)wndW - 2.0f, (REAL)wndH - 2.0f, 12.0f * scale);
         LinearGradientBrush wndGrad(PointF(0, 0), PointF(0, (REAL)wndH),
@@ -1970,8 +2222,8 @@ static void RenderFlyout(HWND hwnd) {
 
         // --- FOOTER: LOG PATH & INTERACTIVE BUTTONS ---
         std::wstring dispPath = L"Z:-Log: " + logPathW;
-        if (dispPath.size() > 48) {
-            dispPath = L"Z:-Log: ..." + logPathW.substr(logPathW.size() - 40);
+        if (dispPath.size() > 35) {
+            dispPath = L"Z:-Log: ..." + logPathW.substr(logPathW.size() - 27);
         }
         g.DrawString(dispPath.c_str(), -1, &fSub, PointF(pad, curY + 6.0f * scale), &brMuted);
 
@@ -2009,6 +2261,8 @@ static void RenderFlyout(HWND hwnd) {
         rightX -= (6.0f * scale + 124.0f * scale);
         drawFooterBtn(rightX, 124.0f * scale, L"Log-Pfad \x00E4ndern...", g_rcBtnChangePath, true);
     }
+
+    FixClearTypeAlpha(pBits, wndW, wndH);
 
     POINT ptSrc = {0, 0};
     POINT ptDst = {posX, posY};
@@ -2088,7 +2342,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             return 0;
         }
         if (PtInRect(&g_rcBtnPumpMax, pt)) {
-            ShellExecuteW(nullptr, L"open", L".\\8_FanControl_AIO_Pumpe_Max_Kurve_Aktivieren.bat", nullptr, L".", SW_SHOWNORMAL);
+            ShellExecuteW(nullptr, L"open", L".\\8_FanControl_AIO_Pumpe_Max_Kurve_Aktivieren.bat", nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         }
         if (PtInRect(&g_rcBtnTariff, pt)) {
@@ -2111,7 +2365,7 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             return 0;
         }
         if (PtInRect(&g_rcBtnConsole, pt)) {
-            ShellExecuteW(nullptr, L"open", L"6_Live_Stromverbrauch_Monitor.bat", nullptr, L".", SW_SHOWNORMAL);
+            ShellExecuteW(nullptr, L"open", L".\\6_Live_Stromverbrauch_Monitor.bat", nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         }
         return 0;
@@ -2131,7 +2385,30 @@ static LRESULT CALLBACK FlyoutWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
 static LRESULT CALLBACK HoverWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_NCHITTEST) {
+        if (g_activeHoverIdx == 4 && g_hoverAnimProgress > 0.25f) {
+            return HTCLIENT;
+        }
         return HTTRANSPARENT;
+    }
+    if (msg == WM_SETCURSOR) {
+        SetCursor(LoadCursorW(nullptr, (LPCWSTR)IDC_HAND));
+        return TRUE;
+    }
+    if (msg == WM_LBUTTONUP && g_activeHoverIdx == 4) {
+        POINT pt = {LOWORD(lParam), HIWORD(lParam)};
+        for (int u = 0; u < 3; u++) {
+            if (PtInRect(&g_rcHoverUnitBtns[u], pt)) {
+                {
+                    std::lock_guard<std::mutex> lock(g_dataMutex);
+                    g_log.netUnitMode = u;
+                    SavePowerConfig();
+                }
+                RenderHoverCard(hwnd);
+                if (g_hudHwnd) RenderHud(g_hudHwnd);
+                return 0;
+            }
+        }
+        return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -2153,6 +2430,26 @@ static LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
     if (msg == WM_LBUTTONUP) {
+        int localX = (short)LOWORD(lParam);
+        if (localX >= g_cardRectsLocal[4].left - 2 && localX <= g_cardRectsLocal[4].right + 2) {
+            {
+                std::lock_guard<std::mutex> lock(g_dataMutex);
+                g_log.netUnitMode = (g_log.netUnitMode + 1) % 3;
+                SavePowerConfig();
+            }
+            if (g_flyoutVisible) {
+                g_flyoutVisible = false;
+                if (g_flyoutHwnd) ShowWindow(g_flyoutHwnd, SW_HIDE);
+            }
+            g_hoveredCardIdx = 4;
+            g_activeHoverIdx = 4;
+            g_hoverAnimProgress = 1.0f;
+            RECT rcCard = g_cardRectsLocal[4];
+            g_hoverAnimCenterX = (float)g_lastPillScreenRect.left + (rcCard.left + rcCard.right) * 0.5f;
+            RenderHud(hwnd);
+            if (g_hoverHwnd) RenderHoverCard(g_hoverHwnd);
+            return 0;
+        }
         g_flyoutVisible = !g_flyoutVisible;
         if (g_flyoutVisible && g_hoverHwnd) {
             ShowWindow(g_hoverHwnd, SW_HIDE);
@@ -2164,7 +2461,7 @@ static LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 0;
     }
     if (msg == WM_RBUTTONUP) {
-        ShellExecuteW(nullptr, L"open", L"6_Live_Stromverbrauch_Monitor.bat", nullptr, L".", SW_SHOWNORMAL);
+        ShellExecuteW(nullptr, L"open", L".\\6_Live_Stromverbrauch_Monitor.bat", nullptr, nullptr, SW_SHOWNORMAL);
         return 0;
     }
     if (msg == WM_SETCURSOR) {
@@ -2180,6 +2477,10 @@ static LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     }
     if (msg == WM_USER + 20) {
         g_forcedHoverIdx = (int)wParam;
+        if (g_forcedHoverIdx >= 1 && g_forcedHoverIdx <= 4 && g_flyoutVisible) {
+            g_flyoutVisible = false;
+            if (g_flyoutHwnd) ShowWindow(g_flyoutHwnd, SW_HIDE);
+        }
         return 0;
     }
     if (msg == WM_TIMER && wParam == 2) {
@@ -2192,30 +2493,37 @@ static LRESULT CALLBACK HudWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         int foundIdx = -1;
         if (!g_flyoutVisible && PtInRect(&g_lastPillScreenRect, ptCur)) {
             int localX = ptCur.x - g_lastPillScreenRect.left;
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 6; i++) {
                 if (localX >= g_cardRectsLocal[i].left - 3 && localX <= g_cardRectsLocal[i].right + 3) {
                     foundIdx = i;
                     break;
                 }
             }
         }
-        if (g_forcedHoverIdx >= 0 && g_forcedHoverIdx < 5) {
+        if (foundIdx == -1 && !g_flyoutVisible && g_activeHoverIdx == 4 && g_hoverAnimProgress > 0.1f) {
+            RECT rcBridge = g_lastHoverScreenRect;
+            rcBridge.bottom = g_lastPillScreenRect.bottom;
+            if (PtInRect(&rcBridge, ptCur)) {
+                foundIdx = 4;
+            }
+        }
+        if (g_forcedHoverIdx >= 0 && g_forcedHoverIdx < 6) {
             foundIdx = g_forcedHoverIdx;
         }
 
         if (foundIdx != g_hoveredCardIdx) {
             g_hoveredCardIdx = foundIdx;
-            if (foundIdx >= 1 && foundIdx <= 3) {
+            if (foundIdx >= 1 && foundIdx <= 4) {
                 g_activeHoverIdx = foundIdx;
             }
             RenderHud(hwnd);
-            if (foundIdx >= 1 && foundIdx <= 3 && g_hoverHwnd) {
+            if (foundIdx >= 1 && foundIdx <= 4 && g_hoverHwnd) {
                 RenderHoverCard(g_hoverHwnd);
             }
         }
 
-        float targetProg = (g_hoveredCardIdx >= 1 && g_hoveredCardIdx <= 3 && !g_flyoutVisible) ? 1.0f : 0.0f;
-        if (g_activeHoverIdx >= 1 && g_activeHoverIdx <= 3) {
+        float targetProg = (g_hoveredCardIdx >= 1 && g_hoveredCardIdx <= 4 && !g_flyoutVisible) ? 1.0f : 0.0f;
+        if (g_activeHoverIdx >= 1 && g_activeHoverIdx <= 4) {
             RECT rcCard = g_cardRectsLocal[g_activeHoverIdx];
             float targetCenterX = (float)g_lastPillScreenRect.left + (rcCard.left + rcCard.right) * 0.5f;
             if (g_hoverAnimCenterX <= 10.0f) {
@@ -2304,7 +2612,7 @@ static void WorkerThreadProc(bool isStandalone) {
     wcHov.lpfnWndProc = HoverWndProc;
     wcHov.hInstance = hInst;
     wcHov.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
-    wcHov.lpszClassName = L"MainPcPowerHoverClass";
+    wcHov.lpszClassName = L"MainPcClaudeHoverClass";
     RegisterClassExW(&wcHov);
 
     HWND hTrayOwner = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -2333,9 +2641,9 @@ static void WorkerThreadProc(bool isStandalone) {
     g_flyoutHwnd = hFlyout;
 
     HWND hHover = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-        L"MainPcPowerHoverClass",
-        L"Main PC Power Hover Card",
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        L"MainPcClaudeHoverClass",
+        L"Main PC Claude Hover Card",
         WS_POPUP,
         0, 0, 10, 10,
         nullptr, nullptr, hInst, nullptr
@@ -2425,7 +2733,7 @@ static void WorkerThreadProc(bool isStandalone) {
     g_hoverHwnd  = nullptr;
     g_flyoutHwnd = nullptr;
     g_hudHwnd    = nullptr;
-    UnregisterClassW(L"MainPcPowerHoverClass", hInst);
+    UnregisterClassW(L"MainPcClaudeHoverClass", hInst);
     UnregisterClassW(L"MainPcCleanSlateFlyoutClass", hInst);
     UnregisterClassW(L"MainPcCleanSlateHudClass", hInst);
     if (g_pdhQuery) {

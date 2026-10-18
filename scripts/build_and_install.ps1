@@ -19,7 +19,7 @@ Stop-Process -Name "TaskbarPowerHud" -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 
 Write-Host "[1/2] Compiling TaskbarPowerHud.exe..." -ForegroundColor Cyan
-& $clang --target=x86_64-w64-mingw32 -std=c++23 -O2 -mwindows -municode -static $srcFile -lgdi32 -luser32 -lshell32 -lgdiplus -lole32 -lcomdlg32 -lpdh -lpsapi -ldwmapi -lshlwapi -ladvapi32 -luuid -o $outExe
+& $clang --target=x86_64-w64-mingw32 -std=c++23 -O2 -mwindows -municode -static $srcFile -lgdi32 -luser32 -lshell32 -lgdiplus -lole32 -lcomdlg32 -lpdh -lpsapi -liphlpapi -ldwmapi -lshlwapi -ladvapi32 -luuid -o $outExe
 if ($LASTEXITCODE -ne 0) { throw "Compilation failed with exit code $LASTEXITCODE" }
 
 Write-Host "[2/2] Registering Windows Autostart & Starting HUD..." -ForegroundColor Cyan

@@ -4,7 +4,7 @@
 
 # Win11 Taskbar Power & Telemetry HUD
 
-**Ultra-lightweight native C++23 Windows 11 Taskbar live wall-power (`AC Watt`), CPU, GPU, and RAM telemetry HUD (`~12.8 MB RAM`, `0.0% Idle CPU`).**
+**Ultra-lightweight native C++23 Windows 11 Taskbar live wall-power (`AC Watt`), CPU, GPU, RAM, and WiFi/Network (`MB/s` · `Mbit/s` · `GB/s`) telemetry HUD (`~12.8 MB RAM`, `0.0% Idle CPU`).**
 
 [![Stars](https://img.shields.io/github/stars/EinMelih/win11-taskbar-power-hud?style=flat-square&color=D97757)](https://github.com/EinMelih/win11-taskbar-power-hud/stargazers)
 [![Star on GitHub](https://img.shields.io/badge/%E2%AD%90_Star_on_GitHub-EinMelih%2Fwin11--taskbar--power--hud-191918?style=flat-square&logo=github&labelColor=D97757)](https://github.com/EinMelih/win11-taskbar-power-hud)
@@ -39,13 +39,13 @@ Because the HUD is written in pure native Win32 C++ (`UpdateLayeredWindow` + GDI
 
 Because this HUD reads hardware sensors directly from native driver interfaces (zero bloatware, no heavy background services), **every PC has slightly different CPU/GPU sensors** (e.g., AMD Ryzen SMU vs. Intel RAPL/HWiNFO, AMD Radeon `atiadlxx.dll` vs. NVIDIA `nvml.dll`, different PSU 80+ efficiency curves).
 
-**You don't need to edit C++ code manually!** Simply clone this repository, open it in your AI coding assistant (**Antigravity, Cursor, Windsurf, Cline, Copilot, or ChatGPT**), and paste this prompt:
+**You don't need to edit C++ code manually!** Simply clone this repository, open it in your AI coding assistant (**Antigravity, Cursor, Windsurf, Cline, Copilot, or ChatGPT**), and paste this prompt (your AI agent can also translate any UI labels/currency to your preferred language automatically):
 
 ```text
 Please check compatibility and set up this Windows 11 Taskbar Power & Telemetry HUD for my PC:
 1. Read `AGENTS.md` first and run the hardware diagnostic scanner: `powershell -ExecutionPolicy Bypass -File .\scripts\check_hardware_for_ai.ps1`.
 2. Verify my CPU model/base clock, GPU vendor (`atiadlxx.dll` vs. `nvml.dll`), RAM size, display DPI, and installed compiler.
-3. Adapt `ReadAllSensors()` and the CPU base clock in `src/taskbar-power-hud.wh.cpp` to match my exact hardware as documented in `AGENTS.md`.
+3. Adapt `ReadAllSensors()`, the CPU base clock, and (if desired) the UI language/currency in `src/taskbar-power-hud.wh.cpp` to match my exact hardware and language as documented in `AGENTS.md`.
 4. Compile and install the HUD into my Windows 11 taskbar by running `.\scripts\build_and_install.ps1`.
 ```
 
@@ -53,10 +53,13 @@ Please check compatibility and set up this Windows 11 Taskbar Power & Telemetry 
 
 ## ✨ Features
 
-* **🎨 Minimalist Warm-Obsidian Dark UI:**
-  * Warm Obsidian (`#191918`) outer pill, graphite micro-cards (`#242321`), crisp off-white typography (`#F5F4EF`), and warm terracotta (`#D97757`) accents & sparklines.
+* **🎨 Compact Minimalist Warm-Obsidian Dark UI:**
+  * Compact Warm Obsidian (`#191918`) outer pill, graphite micro-cards (`#242321`), crisp off-white typography (`#F5F4EF`), and warm terracotta (`#D97757`) accents & sparklines.
 * **⚡ Real-Time Wall Socket Power (`AC Watt`) & 60s Sparkline:**
   * Calculates true wall-outlet power (`AC Watt`) from `CPU Package Power (PPT) + GPU Total Board Power + Dynamic Rest-System (Motherboard/RAM/AIO/Fans/SSDs)` divided by your PSU's 80 PLUS efficiency curve.
+* **🌐 Live WiFi / Network Throughput (`MB/s` · `Mbit/s` · `GB/s`):**
+  * Polls real-time physical network throughput via Windows `GetIfTable2` (`iphlpapi.dll`), automatically filtering out virtual/loopback adapters.
+  * Shows a clean WiFi icon + live throughput in the taskbar pill; hovering over or clicking the WiFi card opens a compact capsule showing separated `↓ Download` & `↑ Upload` speeds plus interactive **`[ MB/s ]  [ Mbit/s ]  [ GB/s ]`** unit selector pills (saved persistently in `power_config.json`).
 * **🎯 1:1 Windows Task Manager GHz Sync:**
   * Queries `\Processor Information(_Total)\% Processor Performance` via `pdh.dll` so CPU clock speed matches the Windows 11 Task Manager to the second decimal (`e.g. 4.58 GHz`).
 * **🌡️ Calibrated Temperature Badges & Throttling Detection:**
@@ -65,10 +68,11 @@ Please check compatibility and set up this Windows 11 Taskbar Power & Telemetry 
   * 🟠 **`77.1 – 86.0 °C`:** Vivid Orange (Heavy Load)
   * 🔴 **`>= 86.1 °C`:** Ruby Red (Near `90°C TjMax` / Thermal Throttling Indicator `⚠️`)
 * **🚀 60-FPS Minimalist Hover Capsules (`[Icon] + App Name + Live Data`):**
-  * Hovering over **`CPU`**, **`GPU`**, or **`RAM`** smoothly glides up a compact 3-row capsule displaying the **real Windows App Icon, clean Application Name, and live resource consumption** of your Top 3 active processes (multi-process apps like Brave, Chrome, Discord, or IDEs are automatically grouped and summed):
+  * Hovering over **`CPU`**, **`GPU`**, **`RAM`**, or **`WiFi`** smoothly glides up a compact 3-row capsule displaying the **real Windows App Icon, clean Application Name, and live resource consumption** of your Top 3 active processes (or Download/Upload + Unit Switcher on the WiFi card):
     * **CPU Hover:** `[App Icon] App Name   4.3% · 3W`
     * **GPU Hover:** `[App Icon] App Name   612M · 0%`
     * **RAM Hover:** `[App Icon] App Name   3.49G · 11%`
+    * **WiFi Hover:** `↓ Download / ↑ Upload` + clickable `[ MB/s ] [ Mbit/s ] [ GB/s ]` switcher
 * **🛡️ 100% `Win + D` (*Show Desktop*) Immune (`0.000 ms` Flicker):**
   * Anchored directly inside `Shell_TrayWnd`'s DWM visual tree via `SetParent(hwnd, hTray)` on a `WS_POPUP | WS_EX_LAYERED` surface — Windows treats the HUD as part of the native taskbar itself, so `Win + D` never minimizes or refreshes it even for a millisecond.
 * **📊 Interactive Click-Flyout Energy & Cost Dashboard:**

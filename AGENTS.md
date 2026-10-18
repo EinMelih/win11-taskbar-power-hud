@@ -60,6 +60,10 @@ In `ReadAllSensors()` (Section 4):
 * Adjust `out.restSystemW` (`36.0 + loadFactor * 9.0` W default for ATX Motherboard + 4 DIMMs + AIO Pump + 5 Fans + 2 SSDs) to match the user's fans/drives.
 * Adjust `eff` (`0.885` / `0.915` / `0.900` default for 80 PLUS Gold) if the user has an 80 PLUS Bronze (`~0.85`), Platinum (`~0.93`), or Titanium (`~0.95`) PSU.
 
+### E) Live Network / WiFi Speed (`MB/s` · `Mbit/s` · `GB/s`) & UI Language / Currency
+* **Network Telemetry:** Uses Windows native `GetIfTable2` (`iphlpapi.dll`, linked via `-liphlpapi`) and works on **100% of Windows 10/11 PCs out of the box** (both WiFi and Ethernet). Users can switch units (`MB/s`, `Mbit/s`, `GB/s`) directly via the WiFi hover capsule or by clicking the WiFi card.
+* **Language & Currency Localization:** The flyout dashboard strings in `RenderFlyout()` are in German (`€`) by default. If the user prefers English (or another language / currency such as `$`, `£`, `CHF`), translate the UI string literals inside `RenderFlyout()` and `OpenSettingsDialog()` in `src/taskbar-power-hud.wh.cpp` to match the user's language.
+
 ---
 
 ## Step 3: Verify Compiler & Build
@@ -73,4 +77,4 @@ In `ReadAllSensors()` (Section 4):
 ---
 
 ## Step 4: Configure Persistent Energy Log Path (`power_config.json`)
-Click the taskbar pill once to open the **Power Analytics Flyout** and click the log-path button (or edit `power_config.json`) to set the desired `power_log.json` path (e.g. a NAS/SMB share like `Z:\` or local disk) and electricity tariff (`eurPerKwh`, default `0.32`).
+Click the taskbar pill once to open the **Power Analytics Flyout** and click the log-path button (or edit `power_config.json`) to set the desired `power_log.json` path (e.g. a NAS/SMB share like `Z:\` or local disk), electricity tariff (`eurPerKwh`, default `0.32`), and default network unit (`"netUnit": "MB" | "Mbit" | "GB"`).
